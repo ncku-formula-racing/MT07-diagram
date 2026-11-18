@@ -503,9 +503,11 @@ def convert(pdf_path: str, page_no: int | None, scale: float, with_number: bool,
     style = ("rounded=1;arcSize=20;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#231F20;"
              f"strokeWidth={fmt(0.33 * scale)};fontSize={fmt(fs)};fontFamily=Helvetica;"
              "fontColor=#000000;spacing=1;align=center;verticalAlign=middle;opacity=95;")
-    for cx, cy, lw, lh, num, lines, _, _ in labels:
+    for cx, cy, lw, lh, num, lines, cx0, cy0 in labels:
+        # anchorX/anchorY keep the original callout center (labels may have been nudged apart)
         W.vertex(cx - lw / 2, cy - lh / 2, lw, lh, style, value="<br>".join(escape(l) for l in lines),
-                 attrs={"ref": num, "tooltip": f"#{num} {names[num]}"})
+                 attrs={"ref": num, "tooltip": f"#{num} {names[num]}",
+                        "anchorX": fmt(cx0), "anchorY": fmt(cy0)})
         stats["labels"] += 1
 
     pw, ph = T.size
