@@ -14,6 +14,7 @@ Convert the Yamaha MT07 wiring diagram PDF into a draw.io (.drawio) file.
   component name.
 - The diagram is stored rotated by 90 degrees in the PDF; it is rotated back to
   landscape on output.
+- Power supplies, grounds and voltages are marked by power_rails.py.
 - A second "Legend" page lists components, wire harnesses and wire color codes.
 
 Usage:
@@ -33,6 +34,7 @@ import sys
 import textwrap
 import urllib.parse
 import zlib
+from collections import defaultdict
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape, quoteattr
 
@@ -50,8 +52,10 @@ WIRE_COLORS = {
 }
 CODE_TO_HEX = {v: k for k, v in WIRE_COLORS.items()}
 
+LABEL_OPACITY = 35   # component label fill/border opacity (percent)
 WIRE_WIDTH = 1.47    # base color stroke width of a wire (pt)
 STRIPE_WIDTH = 1.13  # stripe (dashed) stroke width of a wire (pt)
+CORE_WIDTH = 0.80    # white core of an outlined white wire, and the stripes on it (pt)
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +304,81 @@ def stencil_xml(sps, T: Transform, ox, oy, w, h, op: str) -> str:
     return "".join(parts)
 
 
-def path_key(drawing):
-    return tuple((it[0],) + tuple((round(p.x, 2), round(p.y, 2)) for p in it[1:] if hasattr(p, "x"))
-                 for it in drawing["items"])
+def wire_kind(d):
+    """'base', 'stripe' or 'core' for the stroke-only paths that make up a wire, else None."""
+    if d["type"] != "s" or not is_lines_only(d):
+        return None
+    w = d.get("width") or 0
+    if abs(w - WIRE_WIDTH) < 0.05:
+        return "base"
+    if abs(w - STRIPE_WIDTH) < 0.05:
+        return "stripe"
+    if abs(w - CORE_WIDTH) < 0.02:
+        return "core"
+    return None
+
+
+def sample_path(drawing, step=2.0):
+    pts = []
+    for sp in subpaths(drawing):
+        for seg in sp:
+            a, b = seg[1], seg[-1]
+            n = max(1, int(math.dist((a.x, a.y), (b.x, b.y)) / step))
+            pts += [(a.x + (b.x - a.x) * (k + 0.5) / n, a.y + (b.y - a.y) * (k + 0.5) / n) for k in range(n)]
+    return pts
+
+
+def path_distance(p, drawing):
+    best = 1e9
+    for sp in subpaths(drawing):
+        for seg in sp:
+            a, b = seg[1], seg[-1]
+            dx, dy = b.x - a.x, b.y - a.y
+            L = dx * dx + dy * dy
+            t = 0 if L == 0 else max(0, min(1, ((p[0] - a.x) * dx + (p[1] - a.y) * dy) / L))
+            best = min(best, math.hypot(p[0] - a.x - t * dx, p[1] - a.y - t * dy))
+    return best
+
+
+def classify_wires(drawings):
+    """Return ({base index: color code}, {overlay index: base index}).
+
+    Stripes are matched to the wire they run along by overlap, because a stripe path is
+    not always drawn with exactly the same end points as its base. White wires are drawn
+    as a dark or colored outline with a white core on top.
+    """
+    kinds = {i: k for i, d in enumerate(drawings) if (k := wire_kind(d))}
+    bases = [i for i, k in kinds.items() if k == "base"]
+    overlays = defaultdict(list)
+    overlay_of = {}
+    for i, k in kinds.items():
+        if k == "base":
+            continue
+        pts = sample_path(drawings[i])
+        r = drawings[i]["rect"] + (-1, -1, 1, 1)
+        best, best_i = 0.0, None
+        for b in bases:
+            if not r.intersects(drawings[b]["rect"] + (-0.5, -0.5, 0.5, 0.5)):
+                continue
+            cover = sum(path_distance(p, drawings[b]) < 0.3 for p in pts) / max(1, len(pts))
+            # on a tie prefer the base drawn last before this overlay (paint order)
+            if cover > best + 0.02 or (abs(cover - best) <= 0.02 and best_i is not None and best_i < b < i):
+                best, best_i = cover, b
+        if best >= 0.6:
+            overlay_of[i] = best_i
+            overlays[best_i].append(i)
+    codes = {}
+    for b in bases:
+        base = WIRE_COLORS.get(hexcolor(drawings[b]["color"]), "?")
+        stripes = [WIRE_COLORS.get(hexcolor(drawings[i]["color"]), "?") for i in overlays[b]
+                   if kinds[i] == "stripe" or drawings[i].get("dashes") not in (None, "", "[] 0")]
+        white_core = any(kinds[i] == "core" and hexcolor(drawings[i]["color"]) == "#FFFFFF" for i in overlays[b])
+        if white_core:
+            stripe = next((c for c in reversed(stripes) if c not in ("B", "W")), None)
+            codes[b] = f"W/{stripe}" if stripe else "W"
+        else:
+            codes[b] = f"{base}/{stripes[-1]}" if stripes else base
+    return codes, overlay_of
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +441,7 @@ def convert(pdf_path: str, page_no: int | None, scale: float, with_number: bool,
     if page_no is None:
         page_no = pick_diagram_page(doc)
     page = doc[page_no]
+    page.set_rotation(0)  # a viewer may have saved a page rotation; work in the original frame
     drawings = page.get_drawings()
     tdict = page.get_text("dict")
 
@@ -398,38 +475,16 @@ def convert(pdf_path: str, page_no: int | None, scale: float, with_number: bool,
             continue
         sb = pymupdf.Rect(s["bbox"])
         c = pymupdf.Point((sb.x0 + sb.x1) / 2, (sb.y0 + sb.y1) / 2)
-        hit = None
-        for ci in circle_idx:
-            if ci not in used_circles and drawings[ci]["rect"].contains(c):
-                hit = ci
-                break
+        # smallest enclosing circle: a symbol may draw a larger circle around its callout
+        hit = min((ci for ci in circle_idx if ci not in used_circles and drawings[ci]["rect"].contains(c)),
+                  key=lambda ci: drawings[ci]["rect"].width, default=None)
         if hit is None:  # a number without a circle is not a callout
             continue
         used_circles.add(hit)
         num_spans.add(si)
         callouts.append((int(t), drawings[hit]["rect"]))
 
-    # Pair each wire's base color with its stripe to derive the color code
-    base_by_key = {}
-    for d in drawings:
-        if d["type"] == "s" and abs((d.get("width") or 0) - WIRE_WIDTH) < 0.05 and is_lines_only(d):
-            base_by_key.setdefault(path_key(d), hexcolor(d["color"]))
-    stripe_by_key = {}
-    for d in drawings:
-        if d["type"] == "s" and d.get("dashes") and d["dashes"] != "[] 0" \
-                and abs((d.get("width") or 0) - STRIPE_WIDTH) < 0.05:
-            stripe_by_key.setdefault(path_key(d), hexcolor(d["color"]))
-
-    def wire_code(d):
-        k = path_key(d)
-        base = base_by_key.get(k)
-        if base is None:
-            return None
-        code = WIRE_COLORS.get(base, base)
-        stripe = stripe_by_key.get(k)
-        if stripe:
-            code += "/" + WIRE_COLORS.get(stripe, stripe)
-        return code
+    code_of, overlay_of = classify_wires(drawings)
 
     W = DrawioWriter()
     stats = {"edges": 0, "shapes": 0, "texts": 0, "labels": 0}
@@ -448,14 +503,22 @@ def convert(pdf_path: str, page_no: int | None, scale: float, with_number: bool,
             continue
 
         if typ == "s" and is_lines_only(d):
-            code = wire_code(d)
+            code = code_of.get(i)
+            is_overlay = i in overlay_of
+            if is_overlay:
+                code = code_of[overlay_of[i]]
             style = (f"endArrow=none;startArrow=none;html=1;rounded=0;edgeStyle=none;jumpStyle=none;"
                      f"strokeColor={stroke};strokeWidth={fmt(sw)};")
             if dash:
                 style += f"dashed=1;fixDash=1;dashPattern={dash};"
-            if abs((d.get("width") or 0) - WIRE_WIDTH) < 0.05 or (dash and code):
+            if code:
                 style += "wire=1;"
-            attrs = {"tooltip": f"Wire {code}", "wireColor": code} if code else None
+            if is_overlay:
+                style += "overlay=1;"
+            attrs = None
+            if code:
+                attrs = {"tooltip": f"Wire {code}", "wireColor": code,
+                         "wireId": f"w{overlay_of.get(i, i)}"}
             for sp in sps:
                 pts = [T.pt(sp[0][1])] + [T.pt(seg[2]) for seg in sp]
                 W.edge(pts, style, attrs=attrs)
@@ -500,9 +563,11 @@ def convert(pdf_path: str, page_no: int | None, scale: float, with_number: bool,
         labels.append([cx, cy, lw, lh, num, lines, cx, cy])
     spread_labels(labels, max_shift=6 * scale)
 
+    # see-through fill and border so the drawing underneath stays readable; solid text
     style = ("rounded=1;arcSize=20;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#231F20;"
-             f"strokeWidth={fmt(0.33 * scale)};fontSize={fmt(fs)};fontFamily=Helvetica;"
-             "fontColor=#000000;spacing=1;align=center;verticalAlign=middle;opacity=95;")
+             f"strokeWidth={fmt(0.2 * scale)};fontSize={fmt(fs)};fontFamily=Helvetica;fontStyle=1;"
+             f"fontColor=#0B3D91;spacing=1;align=center;verticalAlign=middle;fillOpacity={LABEL_OPACITY};"
+             f"strokeOpacity={LABEL_OPACITY};textOpacity=100;")
     for cx, cy, lw, lh, num, lines, cx0, cy0 in labels:
         # anchorX/anchorY keep the original callout center (labels may have been nudged apart)
         W.vertex(cx - lw / 2, cy - lh / 2, lw, lh, style, value="<br>".join(escape(l) for l in lines),
@@ -572,6 +637,7 @@ def main():
     ap.add_argument("--scale", type=float, default=4.0, help="coordinate scale factor (default 4)")
     ap.add_argument("--with-number", action="store_true", help="keep the number in labels, e.g. '1. Main switch'")
     ap.add_argument("--label-font", type=float, default=9, help="component label font size (default 9)")
+    ap.add_argument("--no-power", action="store_true", help="do not mark power, ground and voltages")
     ap.add_argument("--no-rotate", action="store_true", help="do not rotate the diagram upright")
     args = ap.parse_args()
 
@@ -580,6 +646,9 @@ def main():
                   args.with_number, args.label_font, False if args.no_rotate else None)
     with open(out, "w", encoding="utf-8") as f:
         f.write(xml)
+    if not args.no_power:
+        import power_rails
+        power_rails.annotate(out)
     print(f"wrote {out}", file=sys.stderr)
 
 

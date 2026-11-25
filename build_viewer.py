@@ -6,8 +6,8 @@ produced by wiring_to_drawio.py.
 - The first page of the .drawio file is rendered to inline SVG (no external
   dependencies, works offline).
 - Wire segments are grouped into circuits (nets): segments are joined where
-  their end points meet, where an end point touches another wire (T junction),
-  and across small gaps between same-colored wire ends (inline markers).
+  their end points coincide, at the splice circles and dots drawn on the wires,
+  and across the circled harness markers that interrupt a wire.
 - Wire end points that terminate on a component are assigned to the nearest
   component callout, scoped by the dashed component boxes.
 - Clicking a wire highlights its whole circuit; clicking a component label
@@ -32,8 +32,11 @@ import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-TOL = 3.0          # end point match tolerance (drawio px)
-GAP_MAX = 40.0     # max gap bridged between same-colored wire ends
+TOL = 1.5          # wire end match tolerance (drawio px)
+SPLICE_DIA, SPLICE_REACH = 8.7, 4.2    # splice circle size, and wire end distance from its center
+MARKER_DIA, MARKER_REACH = 13.4, 6.5   # inline harness marker (circled letter) that interrupts a wire
+GAP_MAX = 32.0     # longest inline connector gap
+LEAD_TOL = 3.0     # touch tolerance for thin lines inside component boxes (drawio px)
 BOX_PAD = 16.0     # dashed box inflation when testing end points
 NEAR_MAX = 160.0   # max distance from a loose end point to a component callout
 
@@ -205,67 +208,96 @@ class Grid:
 # Circuit analysis
 # ---------------------------------------------------------------------------
 
+def component_boxes(cells):
+    """Bounding rectangles of the dashed component outlines."""
+    boxes = []
+    for c in cells:
+        if c.kind == "edge" and c.style.get("dashed") == "1" and c.style.get("wire") != "1" \
+                and len(c.pts) == 5 and math.dist(c.pts[0], c.pts[-1]) < 1:
+            xs = [p[0] for p in c.pts]
+            ys = [p[1] for p in c.pts]
+            boxes.append((min(xs), min(ys), max(xs), max(ys)))
+    return boxes
+
+
+def is_wire_base(c):
+    return c.kind == "edge" and c.style.get("wire") == "1" and c.style.get("overlay") != "1"
+
+
+def round_marks(cells):
+    """Yield (center, diameter, filled) of every small round stencil."""
+    for c in cells:
+        if c.kind == "vertex" and c.style.get("shape", "").startswith("stencil("):
+            x, y, w, h = c.geo
+            if abs(w - h) < 0.6 and w < 16:
+                yield (x + w / 2, y + h / 2), w, c.style.get("fillColor", "none") != "none"
+
+
 def analyze(cells):
-    # Wire segments: group base + stripe edges sharing the same geometry
-    wire_cells = [c for c in cells if c.kind == "edge" and c.style.get("wire") == "1"]
-    seg_index = {}
+    # One segment per base wire edge; stripes and white cores are attached to it
     segments = []  # {"pts", "cells", "color"}
-    for c in wire_cells:
-        key = tuple((round(x, 1), round(y, 1)) for x, y in c.pts)
-        if key not in seg_index:
-            seg_index[key] = len(segments)
-            segments.append({"pts": c.pts, "cells": [], "color": c.attrs.get("wireColor", "?")})
-        s = segments[seg_index[key]]
-        s["cells"].append(c.id)
-        if c.style.get("dashed") != "1" and c.attrs.get("wireColor"):
-            s["color"] = c.attrs["wireColor"]
+    by_wire = defaultdict(list)
+    for c in cells:
+        if is_wire_base(c):
+            by_wire[c.attrs.get("wireId")].append(len(segments))
+            segments.append({"pts": c.pts, "cells": [c.id], "color": c.attrs.get("wireColor", "?")})
+    for c in cells:
+        if c.kind == "edge" and c.style.get("overlay") == "1":
+            cand = by_wire.get(c.attrs.get("wireId"), ())
+            if cand:
+                m = min(cand, key=lambda i: poly_dist(c.pts[0], segments[i]["pts"])[0])
+                segments[m]["cells"].append(c.id)
 
     n = len(segments)
     uf = UnionFind(n)
-    grid = Grid()
-    for i, s in enumerate(segments):
-        for a, b in zip(s["pts"], s["pts"][1:]):
-            grid.add(i, a, b, pad=TOL)
-
-    # 1) end-to-end and T junctions
+    ends_all = [(i, w, segments[i]["pts"][0 if w == 0 else -1]) for i in range(n) for w in (0, 1)]
     connected_end = set()  # (segment, which_end)
-    for i, s in enumerate(segments):
-        for which, p in ((0, s["pts"][0]), (1, s["pts"][-1])):
-            for j, a, b in grid.near(p):
-                if j == i:
-                    continue
-                d, _ = seg_dist(p, a, b)
-                if d <= TOL:
-                    uf.union(i, j)
-                    connected_end.add((i, which))
-                    # mark the other side too when the touch is end-to-end
-                    for w2, q in ((0, segments[j]["pts"][0]), (1, segments[j]["pts"][-1])):
-                        if math.dist(p, q) <= TOL:
-                            connected_end.add((j, w2))
 
-    # 2) bridge small gaps between facing, same-colored loose ends (inline markers)
-    loose = [(i, w) for i in range(n) for w in (0, 1) if (i, w) not in connected_end]
+    # 1) ends that coincide (connector pass-through) or land on another wire
+    for i, w, p in ends_all:
+        for j in range(n):
+            if j != i and poly_dist(p, segments[j]["pts"])[0] <= TOL:
+                uf.union(i, j)
+                connected_end.add((i, w))
+                for w2, q in ((0, segments[j]["pts"][0]), (1, segments[j]["pts"][-1])):
+                    if math.dist(p, q) <= TOL:
+                        connected_end.add((j, w2))
+
+    # 2) splice circles, inline harness markers and solid dots drawn on the wires
     used = set()
-    for ai, (i, wi) in enumerate(loose):
-        pi = segments[i]["pts"][0 if wi == 0 else -1]
-        di = end_dir(segments[i]["pts"], wi)
-        best = None
-        for (j, wj) in loose[ai + 1:]:
-            if j == i or segments[j]["color"] != segments[i]["color"]:
-                continue
-            pj = segments[j]["pts"][0 if wj == 0 else -1]
+    for center, dia, filled in round_marks(cells):
+        touching = [(i, w) for i, w, p in ends_all if math.dist(p, center) <= SPLICE_REACH]
+        if not filled and abs(dia - SPLICE_DIA) <= 0.3 and len(touching) >= 2:
+            for i, w in touching:
+                uf.union(touching[0][0], i)
+                connected_end.add((i, w))
+        elif not filled and abs(dia - MARKER_DIA) <= 0.3:
+            pair = [(i, w) for i, w, p in ends_all if math.dist(p, center) <= MARKER_REACH]
+            if len(pair) == 2 and segments[pair[0][0]]["color"] == segments[pair[1][0]]["color"]:
+                uf.union(pair[0][0], pair[1][0])
+                used.update(pair)
+        elif filled and dia <= 6.0:
+            on = [i for i in range(n) if poly_dist(center, segments[i]["pts"])[0] <= 1.0]
+            for i in on[1:]:
+                uf.union(on[0], i)
+            if len(on) > 1:
+                connected_end.update((i, w) for i, w, p in ends_all if i in on and math.dist(p, center) <= 1.0)
+
+    # 3) inline connectors drawn as a gap between facing same-colored ends, outside any
+    #    component box (inside a box such a gap is an open switch contact)
+    boxes = component_boxes(cells)
+    loose = [(i, w, p) for i, w, p in ends_all if (i, w) not in connected_end and (i, w) not in used
+             and not any(b[0] - 4 <= p[0] <= b[2] + 4 and b[1] - 4 <= p[1] <= b[3] + 4 for b in boxes)]
+    for a, (i, wi, pi) in enumerate(loose):
+        for j, wj, pj in loose[a + 1:]:
             gap = math.dist(pi, pj)
-            if gap > GAP_MAX or gap < 1e-6:
+            if i == j or segments[i]["color"] != segments[j]["color"] or not 0 < gap <= GAP_MAX:
                 continue
-            dj = end_dir(segments[j]["pts"], wj)
+            di, dj = end_dir(segments[i]["pts"], wi), end_dir(segments[j]["pts"], wj)
             ux, uy = (pj[0] - pi[0]) / gap, (pj[1] - pi[1]) / gap
-            # both ends must point at each other along a straight line
             if di[0] * ux + di[1] * uy > 0.98 and -(dj[0] * ux + dj[1] * uy) > 0.98:
-                if best is None or gap < best[0]:
-                    best = (gap, j, wj)
-        if best and (i, wi) not in used and (best[1], best[2]) not in used:
-            uf.union(i, best[1])
-            used.update({(i, wi), (best[1], best[2])})
+                uf.union(i, j)
+                used.update({(i, wi), (j, wj)})
 
     nets = {}
     seg_net = []
@@ -349,6 +381,46 @@ def stencil_outline(cell):
     return polys
 
 
+def assign_min(cost):
+    """Minimum-cost one-to-one assignment (Hungarian). Returns a column, or None, per row."""
+    rows, cols = len(cost), len(cost[0])
+    n = max(rows, cols)
+    big = 1e7
+    m = [[cost[i][j] if i < rows and j < cols else big for j in range(n)] for i in range(n)]
+    u, v, match, way = [0.0] * (n + 1), [0.0] * (n + 1), [0] * (n + 1), [0] * (n + 1)
+    for i in range(1, n + 1):
+        match[0], j0 = i, 0
+        minv, done = [1e18] * (n + 1), [False] * (n + 1)
+        while True:
+            done[j0] = True
+            i0, delta, j1 = match[j0], 1e18, 0
+            for j in range(1, n + 1):
+                if not done[j]:
+                    c = m[i0 - 1][j - 1] - u[i0] - v[j]
+                    if c < minv[j]:
+                        minv[j], way[j] = c, j0
+                    if minv[j] < delta:
+                        delta, j1 = minv[j], j
+            for j in range(n + 1):
+                if done[j]:
+                    u[match[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if match[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            match[j0] = match[j1]
+            j0 = j1
+    out = [None] * rows
+    for j in range(1, cols + 1):
+        if match[j] and match[j] <= rows:
+            out[match[j] - 1] = j - 1
+    return out
+
+
 class BoxCircuit:
     """Thin-line circuit inside one dashed component box.
 
@@ -367,7 +439,7 @@ class BoxCircuit:
         def inbox(px, py):
             return x0 <= px <= x1 and y0 <= py <= y1
 
-        polylines, dots, bodies, housings = [], [], [], []  # body: (rect, outline polylines)
+        polylines, dots, bodies, housings, diodes = [], [], [], [], []  # body: (rect, outline polylines)
         for c in cells:
             if c.kind == "edge":
                 if c.style.get("wire") == "1" or c.style.get("dashed") == "1" \
@@ -379,8 +451,10 @@ class BoxCircuit:
                     # closed outline: a block symbol if large, otherwise a connector
                     # housing or diode triangle that must not join its pins
                     r = (min(xs), min(ys), max(xs), max(ys))
-                    if min(r[2] - r[0], r[3] - r[1]) > 20:
+                    if min(r[2] - r[0], r[3] - r[1]) > 15:
                         bodies.append((r, [c.pts]))
+                    elif any(abs(a[0] - b[0]) > 1 and abs(a[1] - b[1]) > 1 for a, b in zip(c.pts, c.pts[1:])):
+                        diodes.append(r)  # a small triangle
                     else:
                         housings.append(r)
                     continue
@@ -414,11 +488,11 @@ class BoxCircuit:
         for i, pts in enumerate(self.lines):
             for q in pts:
                 for j, a, b in self.grid.near(q):
-                    if j != i and seg_dist(q, a, b)[0] <= TOL:
+                    if j != i and seg_dist(q, a, b)[0] <= LEAD_TOL:
                         uf.union(i, j)
         for k, r in enumerate(dots):
             for i, pts in enumerate(self.lines):
-                if any(rect_dist(q, r) <= TOL for q in pts):
+                if any(rect_dist(q, r) <= LEAD_TOL for q in pts):
                     uf.union(n + k, i)
         self.uf = uf
 
@@ -428,7 +502,9 @@ class BoxCircuit:
             for j in range(i + 1, len(bodies)):
                 ri, rj = rects[i], rects[j]
                 small = min(max(r[2] - r[0], r[3] - r[1]) for r in (ri, rj)) < 20
-                if small and rect_gap(ri, rj) <= TOL:
+                nested = any(rect_gap(a, b) == 0 and b[0] >= a[0] - 1 and b[1] >= a[1] - 1 and b[2] <= a[2] + 1
+                             and b[3] <= a[3] + 1 for a, b in ((ri, rj), (rj, ri)))
+                if nested or (small and rect_gap(ri, rj) <= LEAD_TOL):
                     buf.union(i, j)
         groups = defaultdict(list)
         for i in range(len(bodies)):
@@ -440,20 +516,24 @@ class BoxCircuit:
         for g in groups:
             cl = set()
             for i, pts in enumerate(self.lines):
-                if any(rect_dist(pts[0], rects[k]) <= TOL or rect_dist(pts[-1], rects[k]) <= TOL for k in g):
+                if any(rect_dist(pts[0], rects[k]) <= LEAD_TOL or rect_dist(pts[-1], rects[k]) <= LEAD_TOL for k in g):
                     cl.add(uf.find(i))
             group_clusters.append(cl)
 
         def dist_to_group(a, g):
+            if any(rect_dist(a, rects[k]) == 0 and len(bodies[k][1]) == 1
+                   and math.dist(bodies[k][1][0][0], bodies[k][1][0][-1]) < 0.5 for k in g):
+                return 0.0  # inside a closed symbol
             best = 1e18
             for k in g:
                 for poly in bodies[k][1]:
                     best = min(best, poly_dist(a, poly)[0] if len(poly) > 1 else math.dist(a, poly[0]))
             return best
 
-        # match callouts to wired symbols, closest pairs first, one symbol per callout
-        # (by distance to the drawn outline); leftover callouts share their nearest symbol
+        # match callouts to symbols one-to-one with the smallest total distance (callouts often
+        # sit midway between two symbols, so nearest-first would slip by one along a row)
         self.cluster_owner = defaultdict(set)
+        self.symbol_owner = []
         def extent(g):
             xs = [v for k in g for v in (rects[k][0], rects[k][2])]
             ys = [v for k in g for v in (rects[k][1], rects[k][3])]
@@ -466,23 +546,36 @@ class BoxCircuit:
                 if seg_dist(q, a, b)[0] <= self.PIN_REACH:
                     pin_clusters.add(uf.find(i))
 
+        # a symbol fed only through series diodes (e.g. the neutral light) reaches its pins
+        # across them
+        near_diode = [{uf.find(i) for i, pts in enumerate(self.lines)
+                       if any(rect_dist(q, r) <= LEAD_TOL for q in pts)} for r in diodes]
+        for k in range(len(groups)):
+            if len(group_clusters[k]) > 1 and not group_clusters[k] & pin_clusters:
+                for _ in diodes:
+                    for nd in near_diode:
+                        if nd & group_clusters[k]:
+                            group_clusters[k] |= nd
+
         def reaches_pin(k):
             if group_clusters[k] & pin_clusters:
                 return True
             return any(dist_to_group(q, groups[k]) <= self.PIN_REACH for q in pins)
 
         # candidate symbols: connected to a pin, and not a tiny mark such as an arrow head
-        wired = [k for k in range(len(groups)) if extent(groups[k]) >= 14 and reaches_pin(k)]
+        # (a symbol drawn around a callout also counts: it may be driven from inside the box)
+        def holds(k):
+            return any(rect_dist(a, rects[i]) == 0 and min(rects[i][2] - rects[i][0], rects[i][3] - rects[i][1]) < 70
+                       for i in groups[k] for a in anchors.values())
+
+        wired = [k for k in range(len(groups)) if extent(groups[k]) >= 14 and (reaches_pin(k) or holds(k))]
         if not wired:
             return
-        pairs = sorted((dist_to_group(a, groups[k]), lid, k) for lid, a in anchors.items() for k in wired)
-        owner, taken = {}, set()
-        for d, lid, k in pairs:
-            if lid not in owner and k not in taken:
-                owner[lid] = k
-                taken.add(k)
-        for d, lid, k in pairs:
-            owner.setdefault(lid, k)
+        lids = list(anchors)
+        cost = [[dist_to_group(anchors[lid], groups[k]) ** 2 for k in wired] for lid in lids]
+        owner = {}
+        for r, col in enumerate(assign_min(cost)):
+            owner[lids[r]] = wired[col if col is not None else min(range(len(wired)), key=lambda c: cost[r][c])]
         for lid, k in owner.items():
             for cl in group_clusters[k]:
                 self.cluster_owner[cl].add(lid)
@@ -516,13 +609,7 @@ class BoxCircuit:
 
 def assign_components(cells, segments, seg_net, ends):
     labels = [c for c in cells if "ref" in c.attrs]
-    boxes = []
-    for c in cells:
-        if c.kind == "edge" and c.style.get("dashed") == "1" and c.style.get("wire") != "1" \
-                and len(c.pts) == 5 and math.dist(c.pts[0], c.pts[-1]) < 1:
-            xs = [p[0] for p in c.pts]
-            ys = [p[1] for p in c.pts]
-            boxes.append((min(xs), min(ys), max(xs), max(ys)))
+    boxes = component_boxes(cells)
 
     def area(b):
         return (b[2] - b[0]) * (b[3] - b[1])
@@ -543,17 +630,17 @@ def assign_components(cells, segments, seg_net, ends):
         comps[l.id] = {"ref": int(l.attrs["ref"]), "anchor": anchor, "rect": rect,
                        "box": min(cont, key=area) if cont else None, "nets": set()}
 
-    # Assembly labels sit outside a dashed box: adopt the box they touch
+    # Labels outside any dashed box name the box next to them
     assembly = defaultdict(list)  # box -> label ids
     for lid, c in comps.items():
         if c["box"] is None:
-            touching = [b for b in boxes if rect_dist(c["anchor"], b) <= 30 or
-                        any(inside(b, (px, py)) for px in (c["rect"][0], c["rect"][2])
-                            for py in (c["rect"][1], c["rect"][3]))]
+            touching = [b for b in boxes if rect_dist(c["anchor"], b) <= 40]
             if touching:
-                b = max(touching, key=area)
-                c["assembly"] = b
-                assembly[b].append(lid)
+                b = min(touching, key=lambda b: rect_dist(c["anchor"], b))
+                if any(inside(b, o["anchor"]) for o in comps.values()):
+                    assembly[b].append(lid)  # names a group of components
+                else:
+                    c["box"] = b             # the only name of this component
 
     by_box = defaultdict(list)
     for lid, c in comps.items():
@@ -561,15 +648,30 @@ def assign_components(cells, segments, seg_net, ends):
             by_box[c["box"]].append(lid)
 
     internal = {}
+    pins_of = defaultdict(list)  # label id -> wire ends on it
+    loose_pts = defaultdict(list)
+    for i, w, p, loose in ends:
+        if loose:
+            loose_pts[seg_net[i]].append(p)
     for i, w, p, loose in ends:
         net = seg_net[i]
         cont = [b for b in boxes if inside(b, p, BOX_PAD)]
-        if not loose and not cont:
-            continue  # a junction between wires out in the harness
+        if cont:  # drop neighbouring boxes that are merely within the padding
+            d0 = min(rect_dist(p, b) for b in cont)
+            near = [b for b in cont if rect_dist(p, b) <= d0 + 1]
+            cont = near + [b for b in cont if b not in near and any(box_contains(o, b) for o in near)]
+        if not loose:
+            # a junction: skip it out in the harness, and where the wire merely passes
+            # through a connector on the box border and ends deeper inside the box
+            cont = [b for b in cont if not any(inside(b, q, BOX_PAD) for q in loose_pts[net])]
+            if not cont:
+                continue
         cand = []
         if cont:
             # smallest enclosing box that actually holds a callout
-            for b in sorted(cont, key=area):
+            # (inner boxes win over the box around them; otherwise the nearest box)
+            for b in sorted(cont, key=lambda b: (not any(box_contains(o, b) for o in cont),
+                                                 round(rect_dist(p, b)), area(b))):
                 if by_box.get(b):
                     cand = by_box[b]
                     break
@@ -595,6 +697,7 @@ def assign_components(cells, segments, seg_net, ends):
             chosen = [min(cand, key=lambda lid: math.dist(comps[lid]["anchor"], p))]
         for lid in chosen:
             comps[lid]["nets"].add(net)
+            pins_of[lid].append((i, w))
 
     # an assembly also owns everything that belongs to the callouts inside its box
     for b, lids in assembly.items():
@@ -602,6 +705,8 @@ def assign_components(cells, segments, seg_net, ends):
         for lid in lids:
             for o in inner:
                 comps[lid]["nets"] |= comps[o]["nets"]
+    for lid, c in comps.items():
+        c["pins"] = pins_of[lid]
     return comps
 
 
@@ -653,7 +758,7 @@ def stroke_attrs(style) -> str:
 
 
 def render_svg(cells, width, height, seg_of_cell, comp_index):
-    art, wires, hits, labels = [], [], [], []
+    art, wires, hits, labels, badges, key = [], [], [], [], [], []
     hit_done = set()
     for c in cells:
         s = c.style
@@ -670,6 +775,21 @@ def render_svg(cells, width, height, seg_of_cell, comp_index):
             continue
 
         x, y, w, h = c.geo
+        if c.attrs.get("badge"):
+            fs = s.get("fontSize", "7")
+            cx, cy = x + w / 2, y + h / 2
+            txt = html.escape(c.value)
+            if c.raw.startswith("text;"):
+                weight = ' font-weight="bold"' if s.get("fontStyle") == "1" else ""
+                key.append(f'<text x="{f1(x)}" y="{f1(cy)}" font-size="{fs}"{weight} '
+                           f'dominant-baseline="central">{txt}</text>')
+                continue
+            rot = f' transform="rotate({s["rotation"]} {f1(cx)} {f1(cy)})"' if s.get("rotation") else ""
+            g = (f'<g class="bdg" data-k="{c.attrs.get("power", "")}"{rot}><rect x="{f1(x)}" y="{f1(y)}" width="{f1(w)}" '
+                 f'height="{f1(h)}" rx="{f1(h * .4)}" fill="{s["fillColor"]}" stroke="#fff" stroke-width=".6"/>'
+                 f'<text x="{f1(cx)}" y="{f1(cy)}" font-size="{fs}" fill="{s["fontColor"]}">{txt}</text></g>')
+            (key if c.attrs.get("key") else badges).append(g)
+            continue
         if s.get("shape", "").startswith("stencil("):
             d, op = stencil_d(c)
             fill = s.get("fillColor", "none") if op in ("fill", "fillstroke") else "none"
@@ -696,7 +816,7 @@ def render_svg(cells, width, height, seg_of_cell, comp_index):
         f'<svg id="dia" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {f1(width)} {f1(height)}">'
         f'<rect width="{f1(width)}" height="{f1(height)}" fill="#fff"/>'
         f'<g id="art">{"".join(art)}</g><g id="halo"></g><g id="wires">{"".join(wires)}</g>'
-        f'<g id="hits">{"".join(hits)}</g><g id="labels">{"".join(labels)}</g></svg>'
+        f'<g id="hits">{"".join(hits)}</g><g id="badges">{"".join(badges)}</g><g id="key">{"".join(key)}</g><g id="labels">{"".join(labels)}</g></svg>'
     )
 
 
@@ -737,16 +857,23 @@ button:hover { border-color: var(--accent); }
 #hits polyline { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
 #wires, #art { pointer-events: none; }
 .lbl { cursor: pointer; }
-.lbl rect { fill: #fff; stroke: #231F20; stroke-width: 1.3; }
-.lbl text { font: 9px Helvetica, Arial, sans-serif; fill: #000; text-anchor: middle; dominant-baseline: central; }
-.lbl:hover rect { stroke: var(--accent); stroke-width: 2; }
+.lbl rect { fill: #fff; fill-opacity: __LABEL_OPACITY__; stroke: #231F20; stroke-opacity: __LABEL_OPACITY__; stroke-width: .8; }
+#badges, #key { pointer-events: none; }
+.bdg text { font-family: Helvetica, Arial, sans-serif; font-weight: bold; text-anchor: middle; dominant-baseline: central; }
+#key > text { font-family: Helvetica, Arial, sans-serif; }
+#dia.nobadge #badges { display: none; }
+.lbl text { font: bold 9px Helvetica, Arial, sans-serif; fill: #0B3D91; paint-order: stroke; stroke: #fff; stroke-opacity: .7; stroke-width: 1.6px; stroke-linejoin: round; text-anchor: middle; dominant-baseline: central; }
+.lbl:hover rect { stroke: var(--accent); stroke-opacity: 1; stroke-width: 2; }
 #halo polyline { fill: none; stroke: var(--halo); stroke-width: 18; stroke-linejoin: round; stroke-linecap: round; }
 #dia.dim #art { opacity: .22; }
 #dia.dim .w { opacity: .12; }
 #dia.dim .w.on { opacity: 1; }
 #dia.dim .lbl { opacity: .35; }
 #dia.dim .lbl.on { opacity: 1; }
-.lbl.on rect { stroke: #d9480f; stroke-width: 2.5; fill: #fff4e6; }
+#dia.dim .bdg { opacity: .12; }
+#dia.dim .bdg.on { opacity: 1; }
+#dia.dim #key { opacity: .5; }
+.lbl.on rect { stroke: #d9480f; stroke-opacity: 1; stroke-width: 2; fill: #fff4e6; }
 .lbl.sel rect { fill: #ffd8a8; }
 #zoom { position: absolute; right: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
 #zoom button { width: 34px; height: 34px; padding: 0; font-size: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
@@ -768,6 +895,12 @@ aside { background: var(--panel); border-left: 1px solid var(--line); display: f
 .links a { color: var(--accent); cursor: pointer; text-decoration: none; font-size: 13px; }
 .links a:hover { text-decoration: underline; }
 .links { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+.rail { display: inline-block; border-radius: 5px; padding: 1px 7px; font-size: 12px; font-weight: 700; }
+.note { font-size: 12px; color: var(--muted); margin: 3px 0 6px; }
+#rails { padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 5px; }
+#rails .rail { cursor: pointer; border: 2px solid transparent; }
+#rails .rail:hover, #rails .rail.cur { border-color: var(--accent); }
+header label { font-size: 13px; white-space: nowrap; cursor: pointer; }
 #list { overflow: auto; flex: 1; padding: 6px 0; }
 #list div { padding: 4px 14px; cursor: pointer; display: flex; gap: 8px; }
 #list div:hover, #list div.cur { background: var(--accent-soft); }
@@ -776,6 +909,10 @@ aside { background: var(--panel); border-left: 1px solid var(--line); display: f
   #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr 40%; }
   aside { border-left: 0; border-top: 1px solid var(--line); }
   header .hint { display: none; }
+  header { gap: 8px; padding: 6px 10px; }
+  header h1 { font-size: 13px; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  #app { grid-template-columns: minmax(0, 1fr); }
+  #rails { flex-wrap: nowrap; overflow-x: auto; }
 }
 </style>
 </head>
@@ -785,6 +922,7 @@ aside { background: var(--panel); border-left: 1px solid var(--line); display: f
     <h1>__TITLE__</h1>
     <span class="hint">Click a wire to highlight its circuit, or a component to highlight its wires. Drag to pan, scroll to zoom, Esc to clear.</span>
     <span class="spacer"></span>
+    <label><input type="checkbox" id="showb" checked> Power / ground</label>
     <button id="clear">Clear</button>
   </header>
   <div id="stage">
@@ -794,6 +932,7 @@ aside { background: var(--panel); border-left: 1px solid var(--line); display: f
   </div>
   <aside>
     <input id="search" type="search" placeholder="Search components..." autocomplete="off">
+    <div id="rails"></div>
     <div id="info"><div class="empty">Nothing selected.</div></div>
     <div id="list"></div>
   </aside>
@@ -814,11 +953,14 @@ const segHit = [];
 document.querySelectorAll('#hits polyline').forEach(el => segHit[+el.dataset.s] = el);
 const lblEls = [];
 document.querySelectorAll('#labels .lbl').forEach(el => lblEls[+el.dataset.c] = el);
+const bdgEls = [...document.querySelectorAll('#badges .bdg')];
+bdgEls.forEach((el, i) => el.dataset.n = D.badgeNets[i]);
 const netComps = D.nets.map(() => []);
 D.comps.forEach((c, i) => c.nets.forEach(n => netComps[n].push(i)));
 
 // ---- view (pan / zoom) ----
-const full = svg.viewBox.baseVal;
+const vb0 = svg.viewBox.baseVal;  // live object: copy it
+const full = {x: vb0.x, y: vb0.y, width: vb0.width, height: vb0.height};
 let vb = {x: full.x, y: full.y, w: full.width, h: full.height};
 function applyView() { svg.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`); }
 function fit() {
@@ -903,7 +1045,8 @@ function showTip(e) {
   let text = '';
   if (el && el.parentNode && el.parentNode.id === 'hits') {
     const s = +el.dataset.s;
-    text = 'Wire ' + D.segs[s][1] + ' - click to highlight circuit';
+    const rl = D.nets[D.segs[s][0]].rail;
+    text = 'Wire ' + D.segs[s][1] + (rl ? ' | ' + rl[1] + ' - ' + rl[2] : '') + ' (click to highlight circuit)';
   } else if (el && el.closest && el.closest('.lbl')) {
     const c = D.comps[+el.closest('.lbl').dataset.c];
     text = '#' + c.ref + ' ' + c.name + ' (' + c.nets.length + ' circuits)';
@@ -927,11 +1070,16 @@ function reset() {
   svg.classList.remove('dim');
   halo.textContent = '';
   document.querySelectorAll('#wires .w.on').forEach(el => el.classList.remove('on'));
+  document.querySelectorAll('.bdg.on').forEach(el => el.classList.remove('on'));
+  document.querySelectorAll('#rails .cur').forEach(el => el.classList.remove('cur'));
   document.querySelectorAll('.lbl.on, .lbl.sel').forEach(el => el.classList.remove('on', 'sel'));
   document.querySelectorAll('#list div.cur').forEach(el => el.classList.remove('cur'));
 }
 function lightNets(nets) {
   svg.classList.add('dim');
+  const lit = new Set(nets);
+  bdgEls.forEach(el => el.classList.toggle('on', lit.has(+el.dataset.n)));
+  if (cur && cur.rail === 'GND') bdgEls.forEach(el => +el.dataset.n < 0 && el.classList.add('on'));
   const frag = document.createDocumentFragment();
   for (const n of nets) for (const s of D.nets[n].segs) {
     segEls[s].forEach(el => el.classList.add('on'));
@@ -951,6 +1099,29 @@ function chip(code) {
   const bg = sh ? `repeating-linear-gradient(90deg, ${bh} 0 7px, ${sh} 7px 10px)` : bh;
   return `<span class="chip"><span class="sw" style="background:${bg}"></span>${code}</span>`;
 }
+function railTag(kind, text) {
+  const k = D.kinds[kind];
+  return `<span class="rail" data-k="${kind}" style="background:${k[0]};color:${k[1]}">${esc(text)}</span>`;
+}
+function railInfo(n) {
+  const r = D.nets[n].rail;
+  return r ? `<div>${railTag(r[0], r[1])}</div><div class="note">${esc(r[2])}</div>`
+           : '<div class="note">Control / data line, no supply or ground</div>';
+}
+function selectRail(kind) {
+  reset();
+  cur = {rail: kind};
+  const nets = D.nets.map((_, i) => i).filter(i => D.nets[i].rail && D.nets[i].rail[0] === kind);
+  lightNets(nets);
+  const ids = new Set(nets.flatMap(n => netComps[n]));
+  lightComps([...ids]);
+  document.querySelector(`#rails [data-k="${kind}"]`).classList.add('cur');
+  info.innerHTML = `<h2>${railTag(kind, kind)}</h2><div class="note">${esc(D.kinds[kind][2])}</div>
+    <div class="sub">${nets.length} circuit(s), ${ids.size} component(s)</div>` +
+    nets.map(n => `<div class="circuit" data-n="${n}"><div class="chips">${netColors(n).map(chip).join('')}</div>
+      <div class="note">${esc(D.nets[n].rail[1] + ' - ' + D.nets[n].rail[2])}</div>
+      <div class="links">${netComps[n].map(compLink).join('')}</div></div>`).join('');
+}
 function netColors(n) { return [...new Set(D.nets[n].segs.map(s => D.segs[s][1]))].sort(); }
 function compLink(i) {
   const c = D.comps[i];
@@ -965,7 +1136,7 @@ function selectNet(n, keepComp) {
   lightComps(netComps[n]);
   const comps = netComps[n];
   info.innerHTML = `<h2>Circuit ${n + 1}</h2>
-    <div class="sub">${D.nets[n].segs.length} wire segment(s)</div>
+    ${railInfo(n)}<div class="sub">${D.nets[n].segs.length} wire segment(s)</div>
     <div class="chips">${netColors(n).map(chip).join('')}</div>
     <div class="sub" style="margin-top:8px">Connected components (${comps.length})</div>
     <div class="links">${comps.map(compLink).join('') || '<span class="empty">None detected</span>'}</div>`;
@@ -980,7 +1151,7 @@ function selectComp(i, zoom) {
   lightComps([...others], i);
   const rows = c.nets.map(n => {
     const o = netComps[n].filter(j => j !== i);
-    return `<div class="circuit" data-n="${n}"><div class="chips">${netColors(n).map(chip).join('')}</div>
+    return `<div class="circuit" data-n="${n}"><div class="chips">${netColors(n).map(chip).join('')}</div>${railInfo(n)}
       <div class="links">${o.map(compLink).join('') || '<span class="sub">no other component</span>'}</div></div>`;
   }).join('');
   info.innerHTML = `<h2>${c.ref}. ${esc(c.name)}</h2>
@@ -1005,6 +1176,7 @@ info.addEventListener('click', e => {
   const a = e.target.closest('a[data-c]');
   if (a) { selectComp(+a.dataset.c, true); return; }
   const row = e.target.closest('.circuit');
+  if (row && cur && cur.rail) { selectNet(+row.dataset.n); return; }
   if (row && cur && cur.comp != null) {
     const i = cur.comp, n = +row.dataset.n;
     reset();
@@ -1015,6 +1187,11 @@ info.addEventListener('click', e => {
 });
 document.getElementById('clear').onclick = clearSel;
 document.addEventListener('keydown', e => { if (e.key === 'Escape') clearSel(); });
+
+// ---- power / ground ----
+document.getElementById('rails').innerHTML = Object.keys(D.kinds).map(k => railTag(k, k)).join('');
+document.getElementById('rails').addEventListener('click', e => { const r = e.target.closest('.rail'); if (r) selectRail(r.dataset.k); });
+document.getElementById('showb').addEventListener('change', e => svg.classList.toggle('nobadge', !e.target.checked));
 
 // ---- component list / search ----
 const list = document.getElementById('list');
@@ -1041,7 +1218,9 @@ fit();
 
 
 def build(drawio_path: str, page: int = 0) -> tuple[str, dict]:
-    cells, width, height, name = load_drawio(drawio_path, page)
+    import power_rails
+    all_cells, width, height, name = load_drawio(drawio_path, page)
+    cells = [c for c in all_cells if not c.attrs.get("badge")]  # badges carry no geometry
     segments, seg_net, n_nets, ends = analyze(cells)
     comps = assign_components(cells, segments, seg_net, ends)
 
@@ -1062,7 +1241,25 @@ def build(drawio_path: str, page: int = 0) -> tuple[str, dict]:
         "segs": [[seg_net[i], s["color"], bbox(s["pts"])] for i, s in enumerate(segments)],
         "nets": nets,
         "comps": [],
+        "kinds": {}, "badgeNets": [],
     }
+    # rails were written to the wires by power_rails.py
+    by_id = {c.id: c for c in cells}
+    for i, seg in enumerate(segments):
+        a = by_id[seg["cells"][0]].attrs
+        if a.get("power"):
+            nets[seg_net[i]]["rail"] = [a["power"], a["voltage"], a.get("powerNote", "")]
+    used = {n["rail"][0] for n in nets if "rail" in n}
+    data["kinds"] = {k: list(v) for k, v in power_rails.KINDS.items() if k in used}
+    for c in all_cells:  # same order as rendered
+        if c.attrs.get("badge") and not c.attrs.get("key"):
+            if c.attrs.get("symbol"):  # chassis ground symbol inside a component: no wire
+                data["badgeNets"].append(-1)
+                continue
+            mid = (c.geo[0] + c.geo[2] / 2, c.geo[1] + c.geo[3] / 2)
+            seg = min((i for i in range(len(segments)) if nets[seg_net[i]].get("rail", [""])[0] == c.attrs["power"]),
+                      key=lambda i: poly_dist(mid, segments[i]["pts"])[0])
+            data["badgeNets"].append(seg_net[seg])
     for lid in comp_ids:
         c = comps[lid]
         tip = labels[lid].attrs.get("tooltip", "")
@@ -1070,9 +1267,10 @@ def build(drawio_path: str, page: int = 0) -> tuple[str, dict]:
         data["comps"].append({"ref": c["ref"], "name": cname, "nets": sorted(c["nets"]),
                               "box": [round(v) for v in c["rect"]]})
 
-    svg = render_svg(cells, width, height, seg_of_cell, comp_index)
+    svg = render_svg(all_cells, width, height, seg_of_cell, comp_index)
     title = name or "Wiring diagram"
     page_html = (PAGE.replace("__TITLE__", html.escape(title))
+                 .replace("__LABEL_OPACITY__", ".35")
                  .replace("__SVG__", svg)
                  .replace("__WIRE_HEX__", json.dumps(WIRE_HEX))
                  .replace("__DATA__", json.dumps(data, separators=(",", ":"))))
